@@ -1,0 +1,80 @@
+schema: "5.1"
+repo: sunandbean/wan2.2-i2v-a14b-p100a
+name: wan2.2-i2v-a14b-p100a
+# This port runs the ComfyUI repackaged single files, all six of which live in one Apache-2.0
+# repo: the two experts, their two lightx2v 4-step LoRAs, the Wan 2.1 VAE and the UMT5-XXL text
+# encoder. `weights:` pulls exactly those six into the HF cache and tt_wan22/config.py resolves
+# each one from there.
+weights:
+  repo: Comfy-Org/Wan_2.2_ComfyUI_Repackaged
+  allow_patterns:
+    - split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors
+    - split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors
+    - split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors
+    - split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors
+    - split_files/vae/wan_2.1_vae.safetensors
+    - split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors
+kind: tt-dit-server
+arch: blackhole
+
+image:
+  registry: hf
+
+source:
+  tt_metal: {repo: https://github.com/tenstorrent/tt-metal, ref: v0.80.0-dev20260921}
+  code:
+    # tt_wan22.vae builds tt-metal's own WanEncoder / WanDecoder, and every port in this family
+    # reaches models.tt_dit.utils.matmul for get_matmul_config -- an import the module guards and
+    # falls back to None on, so an under-listed allowlist builds and loads cleanly and only fails
+    # on the first matmul. List it rather than discover that at serve.
+    - models/common
+    - models/tt_dit
+  extra_code:
+    - root: {repo: https://github.com/SunandBean/tt-wan22, ref: v0.1.2}
+      paths: [tt_wan22]
+  ubuntu: "22.04"
+  python: "3.12"
+
+runtime:
+  app: tt_wan22.server:app
+  mesh_shape_env: WAN_MESH_SHAPE
+  packages:
+    - diffusers
+    - safetensors
+    - huggingface_hub
+    - numpy
+    - sentencepiece
+
+serve:
+  port: 8000
+  hardware: p100a
+  mesh_device: P100
+  env:
+    ARCH_NAME: blackhole
+    # A segment is 4 DiT steps over 81 frames plus a streamed VAE decode; the longest single op
+    # is well inside this, but an expert swap between steps 1 and 2 reloads 14 GB of weights.
+    TT_METAL_OPERATION_TIMEOUT_SECONDS: "900.0"
+
+verify:
+  - "import tt_wan22.server as s; assert s.app"
+  - "from tt_wan22.config import COMFY_FILES; assert len(COMFY_FILES) == 6"
+
+card:
+  description: >
+    Wan 2.2 image-to-video A14B with the lightx2v 4-step LoRA, ported to one Tenstorrent
+    Blackhole p100a. Both 14B experts and the Wan 2.1 VAE run on the card; the UMT5-XXL prompt
+    encoder runs on the CPU. All weights are Apache-2.0 and are never redistributed here.
+  quickstart: |
+    ### Request shape
+
+    `POST /predict` takes `{"prompt": str, "start_image": b64, "end_image": b64 | null,
+    "width": int, "height": int, "length": int, "seed": int}` and returns the segment's raw
+    uint8 RGB frames as `frames_b64` with `shape`, a `last_frame` PNG and `timing_s`.
+
+    One **segment** at a time -- an image plus a prompt in, a short clip out. Chain segments by
+    feeding `last_frame` back as the next `start_image`. `length` must be 4n+1 (the VAE's
+    temporal stride) and the LoRA fixes the schedule at **4 steps**; anything else is a 422.
+
+    The envelope (832x480, 81 frames by default) is fixed at startup because it decides whether
+    both experts stay resident on the card or swap between steps. Widen it with `WAN_MAX_W`,
+    `WAN_MAX_H` and `WAN_MAX_FRAMES` before starting the server, not per request.
